@@ -1,10 +1,10 @@
-# Document Loaders & Chunking (Notes)
+# Document Loaders, Chunking, and Advanced RAG Patterns
 
-This document summarizes common document loaders, ingestion pipelines, and best practices for chunking (including semantic chunking).
+This document consolidates the ingestions patterns, chunking strategies, and advanced retrieval techniques used in the project. It also captures the practical scaling guidance for vector databases and production trade-offs shown in the course visuals.
 
 ---
 
-## 🔄 Data Flow
+## 1. RAG Data Flow
 
 ```mermaid
 flowchart LR
@@ -17,25 +17,40 @@ flowchart LR
 
     subgraph Schema ["Document Schema"]
         H["page_content<br><i>(text)</i>"]
-        I["metadata<br><i>(source, author, page, url)</i>"]
+        I["metadata<br><i>(source, author, page, url, file_path)</i>"]
     end
     C --- Schema
 ```
 
+A typical retrieval-augmented generation pipeline is:
+
+1. Load source documents.
+2. Split into chunks.
+3. Embed each chunk.
+4. Store vectors in a vector DB.
+5. Retrieve relevant chunks.
+6. Pass the retrieved evidence to an LLM.
+
+Keep metadata throughout the pipeline so chunks can be traced back to the original document and source.
+
 ---
 
-## 📄 Document Schema
+## 2. Document Schema
 
-Each loaded `Document` typically contains:
+Each loaded `Document` usually includes:
 
-- **`page_content`** — the extracted text.
-- **`metadata`** — dictionary with contextual fields like `source`, `author`, `page`, `url`, `file_path`.
+- `page_content`: the extracted text.
+- `metadata`: contextual data such as `source`, `author`, `page`, `url`, `file_path`, document title, and section headers.
 
-Include extra metadata where useful (document title, section headings, published date) to improve retrieval relevance.
+Best practice:
+
+- Preserve metadata from the original source.
+- Include `source` and page/section metadata for higher-precision retrieval.
+- Store enough context so the retriever can explain where a result came from.
 
 ---
 
-## 🛠️ Core Document Loaders
+## 3. Core Document Loaders
 
 | Loader | Source type | Notes / Best use |
 | :--- | :--- | :--- |
@@ -47,7 +62,7 @@ Include extra metadata where useful (document title, section headings, published
 | `WebBaseLoader` | Web pages (`https://`) | Scrapes and extracts page text. Use responsibly and respect robots.txt / rate limits. |
 | `UnstructuredLoader` | Mixed / complex | Uses the `unstructured` package to handle many file types robustly. |
 
-### PDF loader notes
+### Loader notes
 
 - `PyPDFLoader`: basic extraction, fast and lightweight.
 - `PyMuPDFLoader` (MuPDF / Fitz): faster, better layout metadata.
@@ -74,9 +89,9 @@ Keep metadata through the pipeline so retrieved chunks can be traced back to the
 
 ---
 
-## 📦 Chunking: Why it matters
+## 4. Chunking: Why it matters
 
-Chunking splits text into smaller units (chunks) that are embedded and stored in a vector index. Good chunking preserves meaning within a chunk and enables accurate retrieval. Poor chunking leads to irrelevant or incomplete answers.
+Chunking is the process of splitting documents into smaller units before embedding. Good chunking improves retrieval quality, while poor chunking can bury relevant context or mix unrelated ideas in the same chunk.
 
 Key variables when chunking:
 
@@ -170,94 +185,247 @@ flowchart TD
 
 - **Recursive** is the default for speed and simplicity.
 - **Semantic** is best when quality and meaning preservation matter most.
-- **Code** and **Markdown** often need specialized splitting logic.
-
-### The 80/20 rule
-
-- **Recursive = 80% of the way**
-- **Semantic = the last 20%**
-- **Start recursive, upgrade if needed**
+- **Late chunking** is useful for long-context retrieval when broad document context is valuable.
 
 ---
 
-## 🧠 Late Chunking
+## 6. Advanced RAG Patterns in the Project
 
-Traditional chunking can lose context because each chunk is embedded in isolation. Late chunking embeds a larger document first, then creates chunk embeddings by pooling the token embeddings belonging to each chunk.
+The project demonstrates several retrieval patterns beyond a simple vector similarity lookup.
 
-```text
-Document -> full-document token embeddings -> chunk boundaries -> pooled chunk embeddings
+### 6.1 Multi-query retriever
+
+`MultiQueryRetriever` generates multiple reformulations of the same user question and retrieves against each variant. This helps recover documents that match different phrasing or synonyms.
+
+Example pattern from the code:
+
+```python
+retriever = MultiQueryRetriever.from_llm(
+    retriever=vectorstore.as_retriever(search_kwargs={"k": 2}),
+    llm=model,
+)
+
+query = "What tools can I use to build AI applications?"
+docs = retriever.invoke(query)
 ```
 
-This can preserve broader document context, but it requires an embedding model that supports long-context late chunking. It is not the same as splitting a document after generating one vector for the entire document.
+Use when:
+
+- the user query is ambiguous,
+- your retrieval needs better recall,
+- the same concept can be described in multiple ways.
+
+### 6.2 Contextual compression retriever
+
+`ContextualCompressionRetriever` wraps a base retriever and compresses or filters the returned content before it reaches the model. This reduces noise and keeps the context smaller.
+
+Example pattern:
+
+```python
+compressor = LLMChainExtractor.from_llm(llm)
+compression_retriever = ContextualCompressionRetriever(
+    base_compressor=compressor,
+    base_retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
+)
+```
+
+Use when:
+
+- retrieved chunks are too verbose,
+- a high-level semantic search returns mixed or noisy passages,
+- you want to preserve only the relevant evidence.
+
+### 6.3 Ensemble / hybrid search
+
+Hybrid search combines lexical retrieval and vector retrieval.
+
+Example pattern:
+
+```python
+bm25_retriever = BM25Retriever.from_documents(TECH_DOCS)
+bm25_retriever.k = 3
+semantic_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+
+ensemble_retriever = EnsembleRetriever(
+    retrievers=[bm25_retriever, semantic_retriever],
+    weights=[0.4, 0.6],
+)
+```
+
+Why it matters:
+
+- **BM25** is strong for exact keyword matching and technical terms.
+- **Semantic retrieval** is strong for conceptual similarity and paraphrases.
+- **Hybrid search** balances both.
+
+This is useful for queries like:
+
+- "fast similarity lookup for embeddings"
+- "ACID transactions"
+- "How do I store AI model outputs for later retrieval?"
+
+### 6.4 Parent-document retriever
+
+`ParentDocumentRetriever` stores both a small child chunk for search and a larger parent chunk for context. This is useful when the best retrieval chunk is small, but the final answer needs broader surrounding context.
+
+Example logic from the project:
+
+```python
+parent_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,
+    docstore=store,
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+```
+
+Use when:
+
+- the relevant fact is small, but the surrounding section matters,
+- you want precise retrieval without losing document-level context,
+- you need richer answer grounding for long docs.
 
 ---
 
-## 🧮 Embeddings vs. Chat Models
+## 7. Production Vector Search: HNSW Trade-offs
 
-- **Embedding model**: text in -> vector out. Used for similarity search.
-- **Chat model**: text in -> text out. Used to generate or transform natural-language responses.
+The course image highlights the most important choices in HNSW vector indexing.
+
+### Two parameters that matter
+
+| Parameter | Meaning | Effect of higher value |
+| :--- | :--- | :--- |
+| `M` | Maximum connections per node | More memory, better recall/accuracy |
+| `ef` | Search effort during query-time traversal | Slower search, better accuracy |
+
+### Practical trade-off summary
+
+- **More `M`** = more connections = more memory = better accuracy.
+- **More `ef`** = more search effort = slower = better accuracy.
+- In production, you usually must pick two among: **accuracy**, **speed**, and **memory**.
+
+### Typical production choices
+
+| Use case | `M` | `ef` | Priority |
+| :--- | ---: | ---: | :--- |
+| Prototype | 16 | 40 | Speed |
+| Production | 16 | 100 | Balanced |
+| High accuracy | 32 | 200 | Accuracy |
+
+This is the classic vector-search production trade-off: increasing recall and accuracy generally costs more time and memory.
 
 ---
 
-## 🎟️ Token Budgeting
+## 8. When and How to Scale Vector Stores
 
-Token budgeting controls how much text an LLM request can process and helps keep usage predictable in production.
+### Vertical scaling (scale up)
 
-### Why token budgeting is needed
+Vertical scaling means increasing CPU and RAM on a single database instance.
 
-LLM providers commonly charge based on input and output tokens. Without a budget, a long user prompt, retrieved context, or generated response can:
+Pros:
 
-- Increase the cost of a single request unexpectedly.
-- Exceed the model's context window and cause a request to fail.
-- Increase latency because the model must process more input and output.
-- Make application costs difficult to forecast and control.
-- Allow one unusually large request to consume a disproportionate share of a usage quota.
+- simple deployment,
+- no code changes,
+- lower operational complexity.
 
-Token budgeting is therefore both a cost-control mechanism and a reliability safeguard. It should be applied before calling the model, not after an oversized request has already been sent.
+Cons:
 
-### What the token budget implementation does
+- hardware limits,
+- capacity ceiling.
 
-The example uses two cooperating classes:
+Best for:
 
-| Component | Responsibility |
-| :--- | :--- |
-| `TokenBudget` | Estimates tokens, checks request limits, records usage, and reports statistics. |
-| `BudgetedLLM` | Checks a query against the budget, invokes the LLM when allowed, estimates output usage, and records the request. |
+- under roughly 10M vectors,
+- moderate to small production workloads,
+- teams that want the simplest setup first.
 
-The flow is:
+### Horizontal scaling (shard)
+
+Horizontal scaling means splitting data across multiple nodes or instances.
+
+Pros:
+
+- unlimited scale potential,
+- stronger capacity for very large indexes.
+
+Cons:
+
+- more complex architecture,
+- result merging and coordination overhead,
+- higher operational complexity.
+
+Best for:
+
+- larger production systems,
+- more than 10M vectors,
+- workloads with heavy throughput and memory demands.
+
+### Rule of thumb
+
+> Most apps never need sharding. A single well-tuned instance often handles millions of vectors. Don’t over-engineer too early.
+
+---
+
+## 9. Managed vs Self-hosted Vector Databases
+
+The image recommends a practical decision flow for choosing between managed and self-hosted vector databases.
+
+### Key comparison
+
+| Factor | Managed (e.g. Pinecone) | Self-hosted (e.g. pgvector) |
+| :--- | :--- | :--- |
+| Scaling | Automatic | You manage |
+| Ops burden | Zero | Significant |
+| Cost at scale | 65530$ | Lower $ |
+| Control | Limited | Full |
+
+### Decision flow
 
 ```mermaid
 flowchart TD
-    Q["User query"] --> E["Estimate input tokens"]
-    E --> C{"Within request budget?"}
-    C -- No --> X["Reject with ValueError"]
-    C -- Yes --> L["Invoke the LLM"]
-    L --> O["Estimate output tokens"]
-    O --> R["Record input, output, and request count"]
-    R --> A["Return response and usage statistics"]
+    A["START"] --> B{"Under 1M vectors?"}
+    B -- Yes --> C["Single pgvector is fine"]
+    B -- No --> D{"Have DevOps team?"}
+    D -- No --> E["Use Pinecone"]
+    D -- Yes --> F{"Cost is primary concern?"}
+    F -- Yes --> G["Self-host pgvector"]
+    F -- No --> H["Pinecone for convenience"]
 ```
 
-### How token budgeting works
+### Practical guidance
 
-1. **Estimate the input.** `estimate_tokens()` uses a lightweight approximation: word count multiplied by `1.3`. This is useful for a demo, but a production system should use the tokenizer for the selected model, such as `tiktoken` where supported.
-2. **Check the limit before invocation.** `check_budget()` compares the estimated input tokens with `max_tokens_per_request`, which defaults to `4000` in `TokenBudget`.
-3. **Reject oversized requests.** If the estimate is greater than the limit, `BudgetedLLM.invoke()` raises a `ValueError` and does not call the LLM.
-4. **Invoke allowed requests.** Queries within the limit are sent to the configured model, such as `gpt-4o-mini` in the example.
-5. **Estimate output usage.** The returned response is estimated with the same method. A production implementation should prefer token counts reported by the provider response when available.
-6. **Record usage.** `record_usage()` tracks total input tokens, total output tokens, and request count.
-7. **Report metrics.** `get_stats()` returns total tokens and average tokens per request, making usage visible for monitoring and cost analysis.
+- If you are small or early-stage, start with a single `pgvector` instance or a managed service.
+- If you have no ops capacity, a managed vector DB is usually the easiest route.
+- If your vector count grows and cost becomes critical, self-hosting can become attractive.
+- If you have strong engineering operations capacity and need more control, self-hosting can be a smart long-term decision.
 
-The example demonstrates both paths: a short question is accepted, while an intentionally long query is rejected when the budget is set to `100` tokens.
+---
 
-### Practical production guidance
+## 10. Best Practices for Production RAG
 
-- Set separate limits for input context and generated output when the provider supports them.
-- Count system prompts, chat history, retrieved documents, and tool results, not only the user's latest message.
-- Reserve headroom for the model's response so the combined request stays within the context window.
-- Use the model's actual tokenizer or provider-reported usage for billing decisions; word-based estimates are only approximate.
-- Record rejected requests as well as successful usage so budget failures can be diagnosed.
-- Decide whether oversized requests should be rejected, summarized, or truncated. Preserve important instructions and retrieved evidence when reducing context.
-- Combine per-request limits with per-user, per-tenant, and monthly spending limits for stronger cost controls.
+- Keep chunk sizes moderate and consistent.
+- Preserve source metadata with each chunk.
+- Use recursive chunking first, then improve with semantic chunking if needed.
+- Combine semantic retrieval with keyword search when domain-specific terms matter.
+- Use compression or parent-document patterns when retrieval context is noisy or too broad.
+- Tune `M` and `ef` based on the accuracy–speed–memory trade-off.
+- Avoid scaling too early; single-instance optimization solves most real-world cases.
+- Use managed services when convenience and zero ops burden matter more than raw control.
+
+---
+
+## 11. Summary
+
+The project demonstrates that retrieval quality depends on three things working together:
+
+1. Good document ingestion and metadata preservation.
+2. Strong chunking strategy based on content type.
+3. An appropriate retrieval pattern for the question and latency requirements.
+
+For production systems, the right answer is rarely “the biggest or most advanced architecture.” It is usually the smallest system that meets the retrieval quality and latency goals with enough headroom to scale when needed.
 
 ### SemanticCache and CachedLLM
 
@@ -523,3 +691,125 @@ Using Langsmith as an observability tool
 
 
 For structured docs recursive chunking is better where as for unstructured docs that's where semantic chunking shines
+
+Advanced RAG Strategies - 
+
+1) Parent Document Retriver - Basically we search small chunks first as they are faster and more accurate and then search bigger chunks with them for more context, this is an advanced rag method
+2) Contextual Compression for retreivel - In LangChain, a compressor is a processing module that filters, trims, or transforms retrieved document chunks before they are passed to your prompt or main LLM chain.
+
+What compressor is in your code:
+Here, compressor = LLMChainExtractor.from_llm(llm) uses an LLM (in your case, Google Gemini) specifically to read through retrieved documents and extract only the sentences or passages that directly answer or relate to the query, stripping out any irrelevant filler text.
+
+What is its use?
+Standard vector search usually retrieves entire chunks (e.g., 500–1000 words per document). Often, only a few sentences in those chunks are relevant to the user's question, while the rest is irrelevant clutter.
+
+The compressor solves this problem through a two-step retrieval pipeline:
+
+Base Retriever: Fetches the top-4 full document chunks from your vector database (which might contain a lot of extra, non-essential text).
+
+Compressor (LLMChainExtractor): Receives those 4 full documents, evaluates each one against the user's query using the LLM, extracts only the exact relevant sentences, and drops the rest.
+
+Key Benefits
+Reduces Token Usage: You don't waste tokens sending irrelevant background text to your final LLM prompt.
+
+Reduces Prompt Noise ("Lost in the Middle"): Large language models perform better when given concise, highly targeted context rather than long documents stuffed with irrelevant details.
+
+Saves Cost and Latency: Passing smaller, cleaner context downstream leads to faster final responses and lower API costs.
+
+Visual Workflow -> 
+[ User Query ]
+      │
+      ▼
+[ Vector Store ] ──(retrieves 4 full docs)──► [ Compressor (LLMChainExtractor) ]
+                                                            │
+                                        (strips non-relevant filler text)
+                                                            │
+                                                            ▼
+[ Final Prompt ] ◄──(sends only concise, relevant snippets)─┘
+
+The benefits of this - Reduction of token usage and cost, we have better llm responses, faster processing
+
+Include the rest of the points from advanced_rag.py
+
+Scaling RAG Systems ->
+Index scaling and which parameters matter ->
+HNSW Parameters(Heirarchical navigable small world graphs)
+
+
+pgvector - creating an HNSW index
+CREATE INDEX ON documents
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+At query time, serach ef_search
+SET hnsw.ef_search = 100; Higher = more accurate, slower
+
+Chroma - HNSW settings 
+collection = client.create_collection(
+    name = 'my_collection',
+    metadata = {
+        'hnsw:M': 16,
+        'hnsw:construction_ef': 100,
+        'hnsw:search_ef': 50
+    }
+)
+
+When and how to scale ->
+1) If the query is taking 100 ms or more, likely we have index which is too large for memory so we would need to increase the ram or shard
+2) If the inserting latency is spiking then we have rite bottle neck and solution is to scale rite separately
+3) If we get a lot of out of memory error then the reason for that is basically the index doesn't fit, solution would be to have a bigger instance or shard
+4) If accuracy is dropping then ef_search is very low and the solution would be to increase
+
+
+Pinecone is a fully managed, cloud-native vector database designed for AI workloads, while pgvector is an open-source PostgreSQL extension that adds vector similarity search capabilities directly inside Postgres. Pinecone is ideal for production-scale applications needing serverless scalability and enterprise-grade reliability, whereas pgvector is best suited for developers who want vector search tightly integrated with relational data in Postgres.
+
+🔑 Pinecone Overview
+Type: Managed vector database (SaaS)
+
+Architecture: Serverless, object-storage backed (e.g., AWS S3) with distributed query execution
+
+Performance:
+
+Writes acknowledged in <100ms
+
+Queries remain fast at any scale (p99 latency ~33ms for dense indexes with 10M records)
+
+Features:
+
+Dense, sparse, and full-text indexes in one API
+
+Hybrid search (semantic + keyword + full-text)
+
+Automatic scaling, no cluster management
+
+Enterprise-grade security (SOC 2, HIPAA, GDPR, ISO 27001)
+
+99.95% uptime SLA
+
+Use Cases: RAG pipelines, semantic search, recommender systems, AI agents
+
+🔑 pgvector Overview
+Type: PostgreSQL extension (open-source)
+
+Integration: Runs inside Postgres, vectors stored alongside relational data
+
+Performance:
+
+Supports exact nearest neighbor search (perfect recall)
+
+Approximate search via IVFFlat and HNSW indexes for speed-recall tradeoffs
+
+Features:
+
+Distance metrics: L2, inner product, cosine, L1, Hamming, Jaccard
+
+Supports single-precision, half-precision, binary, and sparse vectors
+
+ACID compliance, point-in-time recovery, JOINs, transactions (all Postgres features)
+
+Works with any language that has a Postgres client
+
+Installation: CREATE EXTENSION vector; after compiling or installing via package managers (Homebrew, Docker, PGXN, etc.)
+
+Use Cases: Embedding search in apps already using Postgres, small-to-medium scale vector workloads
+

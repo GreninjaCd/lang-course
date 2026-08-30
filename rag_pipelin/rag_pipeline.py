@@ -49,7 +49,7 @@ Create your first chain in under 10 lines of code.
 llm = ChatGoogleGenerativeAI(model="gemini-flash-latest")
 
 def create_kb():
-    """Create a vector store from knowledfe base."""
+    """Create a vector store from knowledge base."""
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     doc = Document(page_content = KNOWLEDGE_BASE, metadata = {"source": "langchain_knowledge_base.md"})
