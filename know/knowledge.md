@@ -1,10 +1,21 @@
-# Document Loaders, Chunking, and Advanced RAG Patterns
+# RAG Course Knowledge Base
 
-This document consolidates the ingestions patterns, chunking strategies, and advanced retrieval techniques used in the project. It also captures the practical scaling guidance for vector databases and production trade-offs shown in the course visuals.
+A revision guide for Retrieval-Augmented Generation, organized around the course's four-part structure and cross-referenced to the actual code in this repo.
+
+| Part | Topic | What You'll Build |
+| :--- | :--- | :--- |
+| **Part 1** | Build the Foundation | Complete RAG pipeline from scratch |
+| **Part 2** | Debug RAG Failures | Fix the 5 failure modes that break most RAG systems |
+| **Part 3** | Optimize for Quality | Semantic chunking, reranking, multi-query retrieval |
+| **Part 4** | Scale for Production | Caching, monitoring, production vector databases |
+
+> **Stack used throughout this repo:** LangChain (`langchain-classic`, `langchain-community`), Google Gemini via `langchain-google-genai` (`gemini-flash-latest` for chat, `gemini-embedding-2-preview` for embeddings), Chroma as the default vector store, `rank-bm25` for lexical search, LangSmith for tracing, and `langchain-postgres` / Supabase for pgvector. `rag_pipelin/cost_optimization.py` is the one file that uses OpenAI models (`gpt-4o-mini`, `gpt-4o`) instead of Gemini — worth knowing if you go looking for it.
 
 ---
 
-## 1. RAG Data Flow
+## Part 1: Build the Foundation — a Complete RAG Pipeline
+
+### 1.1 The RAG data flow
 
 ```mermaid
 flowchart LR
@@ -16,149 +27,239 @@ flowchart LR
     F --> G["Query / Retriever -> LLM"]
 
     subgraph Schema ["Document Schema"]
-        H["page_content<br><i>(text)</i>"]
-        I["metadata<br><i>(source, author, page, url, file_path)</i>"]
+        H["page_content (text)"]
+        I["metadata (source, author, page, url, file_path)"]
     end
     C --- Schema
 ```
-
-A typical retrieval-augmented generation pipeline is:
 
 1. Load source documents.
 2. Split into chunks.
 3. Embed each chunk.
 4. Store vectors in a vector DB.
-5. Retrieve relevant chunks.
-6. Pass the retrieved evidence to an LLM.
+5. Retrieve relevant chunks for a query.
+6. Pass the retrieved evidence to an LLM to generate an answer.
 
-Keep metadata throughout the pipeline so chunks can be traced back to the original document and source.
+Keep metadata throughout the pipeline so chunks can always be traced back to the original document and source.
 
----
+### 1.2 Document schema
 
-## 2. Document Schema
+Every LangChain `Document` has two parts:
 
-Each loaded `Document` usually includes:
+- `page_content` — the extracted text.
+- `metadata` — contextual data such as `source`, `author`, `page`, `url`, `file_path`, title, section headers.
 
-- `page_content`: the extracted text.
-- `metadata`: contextual data such as `source`, `author`, `page`, `url`, `file_path`, document title, and section headers.
+Best practice: preserve metadata from the original source and include `source`/page/section info so retrieval results are traceable and filterable.
 
-Best practice:
+### 1.3 Document loaders
 
-- Preserve metadata from the original source.
-- Include `source` and page/section metadata for higher-precision retrieval.
-- Store enough context so the retriever can explain where a result came from.
-
----
-
-## 3. Core Document Loaders
-
-| Loader | Source type | Notes / Best use |
+| Loader | Source type | Notes / best use |
 | :--- | :--- | :--- |
-| `PyPDFLoader` | PDF (`.pdf`) | Fast, page-by-page extraction; good for simple PDFs. |
-| `PyMuPDFLoader` | PDF (`.pdf`) | Faster and often extracts richer metadata and layout information. |
-| `UnstructuredPDFLoader` | PDF (`.pdf`) | Best for complex layouts (multi-column, tables); slower but more accurate. |
-| `TextLoader` | Plain text (`.txt`) | Simple text extraction; minimal processing. |
-| `DirectoryLoader` | Folder (`folder/*`) | Batch load files using glob patterns and optional `loader_cls`. |
-| `WebBaseLoader` | Web pages (`https://`) | Scrapes and extracts page text. Use responsibly and respect robots.txt / rate limits. |
-| `UnstructuredLoader` | Mixed / complex | Uses the `unstructured` package to handle many file types robustly. |
+| `PyPDFLoader` | PDF | Fast, page-by-page extraction; good for simple PDFs. |
+| `PyMuPDFLoader` | PDF | Faster, often richer metadata and layout info. |
+| `UnstructuredPDFLoader` / `UnstructuredLoader` | PDF, mixed formats | Best for complex layouts (multi-column, tables); slower but more accurate. |
+| `TextLoader` | `.txt` | Simple text extraction. |
+| `DirectoryLoader` | Folder (`glob`) | Batch load matching files, optionally with a specific `loader_cls`. |
+| `WebBaseLoader` | `https://` | Scrapes and extracts page text. Respect robots.txt / rate limits. |
 
-### Loader notes
+**What this repo actually does — [`basics/document_loaders.py`](../basics/document_loaders.py):** instead of importing `TextLoader`, `WebBaseLoader`, `DirectoryLoader`, and `PyPDFLoader`, that file hand-rolls native-Python equivalents (`Path.read_text`, `requests` + `BeautifulSoup`, `Path.rglob`, and a manual `Document(page_content=..., metadata={"source": ...})` wrap) and only reaches for a real LangChain loader — `UnstructuredLoader` — for the PDF case. It's a useful exercise for understanding what a loader does under the hood, but don't mistake it for "this is how you normally load a `.txt` file in LangChain" — normally you'd just use `TextLoader`.
 
-- `PyPDFLoader`: basic extraction, fast and lightweight.
-- `PyMuPDFLoader` (MuPDF / Fitz): faster, better layout metadata.
-- `UnstructuredPDFLoader`: best for complex documents (tables, columns), but slower.
+### 1.4 Chunking basics
 
-### Web loading
+Chunking splits documents into smaller units before embedding. Key variables:
 
-- Single URL -> `WebBaseLoader` -> single `Document` (or multiple documents if the page has clear sections).
-- Multiple URLs -> `WebBaseLoader` (iterate) -> list of `Document` objects, one per URL or per page section.
+- **Chunk size** — target length per chunk (~200–1000 tokens depending on content).
+- **Overlap** — typically 10–20%, to preserve context across chunk boundaries.
+- **Split boundaries** — fixed, recursive (heuristic), or semantic (meaning-based).
+- **Content type** — legal text, code, markdown, and conversational logs each want different heuristics.
 
-### Directory loading example
+`RecursiveCharacterTextSplitter` doesn't understand meaning directly — it tries separators in order until chunks fit the size budget:
 
-Use `DirectoryLoader(path, glob="**/*.pdf", loader_cls=PyPDFLoader)` to batch-load matching files from a folder and return a list of `Document` objects.
-
----
-
-## 🔁 Document Processing Pipeline (RAG-ready)
-
-Typical pipeline for retrieval-augmented generation (RAG):
-
-1. Document Loaders -> 2. Text Splitters / Chunkers -> 3. Embedding Generation -> 4. Vector Store / Index -> 5. Retriever -> 6. LLM
-
-Keep metadata through the pipeline so retrieved chunks can be traced back to the original source.
-
----
-
-## 4. Chunking: Why it matters
-
-Chunking is the process of splitting documents into smaller units before embedding. Good chunking improves retrieval quality, while poor chunking can bury relevant context or mix unrelated ideas in the same chunk.
-
-Key variables when chunking:
-
-- **Chunk size** — target token length per chunk. Sweet spot: ~200–1000 tokens depending on the content type.
-- **Overlap** — typically 10–20% overlap helps preserve context across chunk boundaries.
-- **Split boundaries** — where you cut text: fixed, recursive (heuristic), or semantic (meaning-based).
-- **Content type** — legal text, code, markdown, and conversational logs each need different split heuristics.
-
----
-
-## Chunking Strategies
-
-- **Fixed-size**: Cut into fixed token/character lengths (fast, simple; can break sentences).
-- **Recursive (heuristic)**: Try paragraph -> sentence -> punctuation -> word. Good balance for many use-cases.
-- **Semantic (meaning-based)**: Use embeddings + similarity between adjacent units to find meaning boundaries. Useful when topic boundaries matter more than processing cost.
-- **Late chunking**: Embed a larger document first, then pool token embeddings for chunks so each chunk can retain broader document context.
-
-Recommended default: start with recursive chunking, then evaluate semantic chunking for high-accuracy knowledge bases. Semantic chunking is not automatically better for every document; it adds embedding cost and depends on the embedding model and threshold.
-
----
-
-## ⭐ Semantic Chunking (Best quality)
-
-Semantic chunking finds splits at meaning boundaries rather than arbitrary positions. Steps:
-
-1. Split the text into small candidate units (sentences or short paragraphs).
-2. Compute embeddings for each candidate unit.
-3. Compare adjacent embeddings (cosine similarity).
-4. When similarity drops significantly, mark a chunk boundary.
-5. Merge adjacent candidates until the target chunk size (and overlap) is reached.
-
-Benefits:
-
-- Produces topic-consistent chunks (fewer mixed-topic chunks).
-- Improves retrieval precision for complex documents (legal, technical manuals).
-
-Simple pseudocode:
-
-```python
-# 1) tokenize into sentences
-# 2) embed each sentence
-# 3) for i in range(len(sentences)-1):
-#     sim = cos_sim(embed[i], embed[i+1])
-#     if sim < threshold: boundary at i
+```text
+paragraphs (\n\n) -> lines (\n) -> sentences -> words -> characters
 ```
 
-Practical tips:
+From [`basics/text_splitter.py`](../basics/text_splitter.py), here's why overlap matters, made concrete:
 
-- Use a windowed approach (compare nearby neighbors, not only immediate neighbor) to avoid noisy splits.
-- Choose a dynamic threshold (e.g., percentile of local similarities) rather than a fixed value for heterogeneous documents.
-- After boundaries are found, merge to meet the target chunk size and desired overlap.
+```python
+text = "The quick brown fox jumps over the lazy dog." * 10
+
+no_overlap = RecursiveCharacterTextSplitter(chunk_size=50, chunk_overlap=0)
+overlap    = RecursiveCharacterTextSplitter(chunk_size=50, chunk_overlap=20)
+
+chunks_with_no_overlap = no_overlap.split_text(text)
+chunks_with_overlap    = overlap.split_text(text)
+# Without overlap: chunk 2 can start mid-sentence with no lead-in context.
+# With overlap: the last ~20 chars of chunk 1 reappear at the start of chunk 2,
+# so a sentence split across the boundary is still readable in both chunks.
+```
+
+### 1.5 Embeddings
+
+From [`basics/embeddings_deep.py`](../basics/embeddings_deep.py):
+
+```python
+embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-2-preview")
+
+# Single text
+vec = embeddings.embed_query("What is Machine Learning?")
+
+# Batch
+vecs = embeddings.embed_documents([
+    "What is Machine Learning?",
+    "What is Deep Learning?",
+])
+
+# Manual cosine similarity ranking
+def cosine_similarity(vec1, vec2):
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+
+similarities = [cosine_similarity(query_vector, doc_vec) for doc_vec in doc_vectors]
+ranked = sorted(zip(docs, similarities), key=lambda x: x[1], reverse=True)
+```
+
+**Embedding caching** avoids re-embedding the same text on every run:
+
+```python
+from langchain_classic.embeddings.cache import CacheBackedEmbeddings
+from langchain_classic.storage import LocalFileStore
+
+store = LocalFileStore(root_path=tempdir)
+cached_embeddings = CacheBackedEmbeddings.from_bytes_store(
+    underlying_embeddings=embeddings,      # the real embedding model
+    document_embedding_cache=store,
+    namespace="exercise",
+)
+```
+
+> ⚠️ **Bug found in this file:** `embedding_caching()` passes `underlying_embeddings=embeddings_model`, but only a module-level `embeddings` object is ever defined in that file — `embeddings_model` doesn't exist there. Calling `embedding_caching()` raises `NameError`. If you run this function, rename that argument to `embeddings`.
+
+### 1.6 Vector stores
+
+From [`basics/vector_store.py`](../basics/vector_store.py) — the three operations you'll use constantly:
+
+```python
+vectorstore = Chroma.from_documents(documents=docs, embedding=embeddings_model, persist_directory=tmpdir)
+
+# 1. Plain similarity search
+results = vectorstore.similarity_search("What is LangChain?", k=2)
+
+# 2. Similarity search with a score attached
+results_with_scores = vectorstore.similarity_search_with_score("Explain vector stores.", k=3)
+
+# 3. Metadata filtering (pre-filter candidates before ranking)
+filtered = vectorstore.similarity_search("What databases are available?", k=5, filter={"topic": "database"})
+```
+
+Score-to-similarity conversion (Chroma returns a *distance*, not a similarity, by default):
+
+```python
+similarity = 1 / (1 + distance)              # or
+similarity = 1 - (distance / max_distance)   # normalize distance instead
+```
+
+### 1.7 Wiring it into a full RAG chain
+
+From [`rag_pipelin/rag_pipeline.py`](../rag_pipelin/rag_pipeline.py) — this is the canonical "small RAG pipeline" shape used throughout the repo:
+
+```python
+retriever = vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 2})
+
+prompt = ChatPromptTemplate.from_template("""
+Answer the question based only on the following context:
+
+{context}
+
+Question: {question}
+
+Answer:
+""")
+
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
+
+rag_chain = (
+    {"context": retriever | format_docs, "question": RunnablePassthrough()}
+    | prompt
+    | llm
+    | StrOutputParser()
+)
+
+rag_chain.invoke("What is LangChain?")
+```
+
+This is the whole pattern: retriever feeds formatted context into a prompt, the LLM answers *only* from that context, and the parser strips it down to plain text. Everything in Parts 2–4 is about making each stage of this chain more accurate, more robust, or cheaper to run.
+
+### 1.8 The two phases of RAG
+
+```text
+Phase 1 — Indexing:  Load -> Chunk -> Embed -> Store
+Phase 2 — Query:     Embed query -> Search -> Retrieve -> Generate -> Answer
+```
+
+The query and the indexed documents must use a **compatible embedding model**. If the embedding model changes, you must re-embed the whole collection — old and new vectors are not comparable.
+
+### 1.9 Three rules of production RAG
+
+1. **Use the same, compatible embedding model consistently** for documents and queries.
+2. **Embedding quality matters more than quantity.** More vectors can't compensate for noisy chunks or a weak embedding model.
+3. **Test retrieval independently of generation.** First verify the correct source chunks come back; only then evaluate the generated answer. If retrieval is wrong, no amount of prompt engineering fixes the answer.
 
 ---
 
-## Best Practices & Defaults
+## Part 2: Debug RAG Failures
 
-- Chunk size: 200–800 tokens for most knowledge bases.
-- Overlap: 10–20%.
-- Use recursive chunking as a fast default; evaluate semantic chunking for high-quality indexes.
-- Preserve metadata (file, page, headings) for each chunk.
-- Respect rate limits and robots.txt when scraping web pages.
+### 2.1 Five common failure modes
+
+1. **Bad chunking** — relevant information is split apart or mixed with unrelated content.
+2. **Embedding mismatch** — documents and queries embedded with incompatible models or preprocessing.
+3. **Retrieval noise** — top results are broadly similar but don't actually answer the question.
+4. **Context overflow** — too much retrieved text exceeds useful context or dilutes the answer ("lost in the middle").
+5. **Hallucination** — the model states unsupported claims when retrieval is incomplete or ambiguous.
+
+### 2.2 Vector normalization
+
+Normalizing a vector scales it to magnitude 1 while preserving direction:
+
+$$
+\hat{v} = \frac{v}{\lVert v \rVert}
+$$
+
+This matters because some similarity metrics (dot product) are magnitude-sensitive, while cosine similarity already normalizes internally. Normalization is **not universally required** — the embedding model, similarity metric, and vector database configuration all have to agree. FAISS, Pinecone, and Chroma can each be configured for normalized or unnormalized vectors depending on their distance metric. A common silent bug: mixing a store configured for cosine distance with vectors that were never normalized (or vice versa), which quietly degrades ranking without throwing an error — a good thing to check first when "retrieval feels off."
+
+### 2.3 When vector search fails: exact terms
+
+Vector search can fail badly when a query hinges on terms with little semantic content:
+
+| Query type | Why dense search fails | What lexical (BM25) search contributes |
+| :--- | :--- | :--- |
+| Product codes, e.g. `SKU-7742X` | Little semantic meaning for the embedding model. | Exact identifier matching. |
+| Error codes, e.g. `E_CONN_REFUSED` | Small character differences can flip meaning. | Finds the exact string in troubleshooting docs. |
+| Acronyms, e.g. `WCAG` | Model may not know it, or expands it inconsistently. | Matches the acronym exactly. |
+| Exact names, e.g. `John Smith Accounting` | Broad semantic matches can override the specific entity. | Preserves the exact phrase match. |
+
+These are common enterprise cases, not edge cases — this is exactly why [Part 3's hybrid search](#36-hybrid-search--hnn-bm25-ensemble-retrieval) exists.
+
+### 2.4 A debugging checklist
+
+When retrieval quality looks bad, check in this order:
+
+1. **Retrieval alone**, before blaming generation — print the retrieved chunks for a failing query.
+2. **Chunk boundaries** — is the answer split across two chunks with no overlap?
+3. **Embedding compatibility** — same model/version for docs and query?
+4. **Query type** — does it contain an exact code/name/acronym that needs BM25, not just vectors?
+5. **Context size** — are you passing so many chunks that the model loses the relevant one in the middle?
 
 ---
 
-## 🧭 Chunking Decision Framework
+## Part 3: Optimize for Quality
 
-Use this decision flow to decide which chunking strategy to use:
+### 3.1 Chunking strategies
+
+- **Fixed-size** — cut into fixed token/character lengths. Fast, simple, can break sentences.
+- **Recursive (heuristic)** — try paragraph → sentence → punctuation → word. Good default for most content.
+- **Semantic (meaning-based)** — embed small units, compare adjacent similarity, split where similarity drops. Better for topic-consistent chunks, at the cost of embedding calls at chunking time.
+- **Late chunking** — embed the whole document first, then pool token embeddings into chunks, so each chunk retains broader document context.
 
 ```mermaid
 flowchart TD
@@ -171,55 +272,67 @@ flowchart TD
     F -- No --> H{"Complex, topic-shifting?"}
     H -- Yes --> I["Semantic"]
     H -- No --> J["Recursive"]
-
 ```
 
-| Content type | Recommended strategy | Chunk boundary / size |
+| Content type | Recommended strategy | Boundary / size |
 | :--- | :--- | :--- |
-| General documents | Recursive | Approximately 500–1000 tokens |
-| Technical documents | Semantic | Semantic boundaries with a maximum size |
-| Code | Code-aware splitter | Functions, classes, or logical blocks |
+| General documents | Recursive | ~500–1000 tokens |
+| Technical / unstructured prose | Semantic | Meaning boundary with a max size cap |
+| Code | Code-aware splitter | Functions, classes, logical blocks |
 | Markdown | Markdown-aware splitter | Headers and sections |
 
-### Practical recommendation
+**Practical rule of thumb:** structured documents (clear headers, paragraphs) usually do fine with recursive chunking, because the separators already line up with meaning boundaries. Semantic chunking earns its extra embedding cost on *unstructured* prose — transcripts, long narrative text — where there are no reliable separators to split on in the first place.
 
-- **Recursive** is the default for speed and simplicity.
-- **Semantic** is best when quality and meaning preservation matter most.
-- **Late chunking** is useful for long-context retrieval when broad document context is valuable.
+### 3.2 Semantic chunking, for real
 
----
+From [`chunking/semantic_chunking.py`](../chunking/semantic_chunking.py):
 
-## 6. Advanced RAG Patterns in the Project
+```python
+semantic_chunker = SemanticChunker(
+    embeddings,
+    breakpoint_threshold_type="percentile",
+    breakpoint_threshold_amount=90,   # split at the 90th percentile of dissimilarity
+)
+semantic_chunks = semantic_chunker.split_text(document)
+```
 
-The project demonstrates several retrieval patterns beyond a simple vector similarity lookup.
+Under the hood this is: split into sentences → embed each → compare adjacent (or windowed) embeddings via cosine similarity → cut where similarity drops sharply → merge small fragments up to a target size.
 
-### 6.1 Multi-query retriever
+**Production version with fallback** — from [`chunking/prod_ready.py`](../chunking/prod_ready.py):
 
-`MultiQueryRetriever` generates multiple reformulations of the same user question and retrieves against each variant. This helps recover documents that match different phrasing or synonyms.
+```python
+def smart_chunker(text, use_semantic=True, fallback_chunk_size=500):
+    if use_semantic:
+        try:
+            chunks = SemanticChunker(embeddings, breakpoint_threshold_type="percentile",
+                                      breakpoint_threshold_amount=90).split_text(text)
+            if any(len(c) > 2000 for c in chunks):     # guard against runaway chunks
+                return _recursive_fallback(text, fallback_chunk_size)
+            return chunks
+        except Exception:
+            return _recursive_fallback(text, fallback_chunk_size)   # embedding API down, etc.
+    return _recursive_fallback(text, fallback_chunk_size)
+```
 
-Example pattern from the code:
+The pattern worth remembering: semantic chunking is best-effort quality, recursive is the reliability fallback. Never ship semantic chunking without a fallback path — it depends on a live embedding call succeeding at ingest time.
+
+### 3.3 Multi-query retrieval
+
+From [`chunking/advanced_rag.py`](../chunking/advanced_rag.py) — generates several rephrasings of the user's question and retrieves against each, to recover documents that match different phrasing:
 
 ```python
 retriever = MultiQueryRetriever.from_llm(
     retriever=vectorstore.as_retriever(search_kwargs={"k": 2}),
     llm=model,
 )
-
-query = "What tools can I use to build AI applications?"
-docs = retriever.invoke(query)
+docs = retriever.invoke("What tools can I use to build AI applications?")
 ```
 
-Use when:
+Use when the query is ambiguous, recall is too low, or the same concept can be phrased many ways.
 
-- the user query is ambiguous,
-- your retrieval needs better recall,
-- the same concept can be described in multiple ways.
+### 3.4 Contextual compression
 
-### 6.2 Contextual compression retriever
-
-`ContextualCompressionRetriever` wraps a base retriever and compresses or filters the returned content before it reaches the model. This reduces noise and keeps the context smaller.
-
-Example pattern:
+Wraps a base retriever and strips each returned chunk down to only the sentences relevant to the query, using an LLM as the compressor:
 
 ```python
 compressor = LLMChainExtractor.from_llm(llm)
@@ -229,17 +342,38 @@ compression_retriever = ContextualCompressionRetriever(
 )
 ```
 
-Use when:
+```text
+[ Vector Store ] --(retrieves 4 full chunks)--> [ Compressor (LLMChainExtractor) ]
+                                                          |
+                                       (strips non-relevant filler text)
+                                                          v
+[ Final Prompt ] <--(only concise, relevant snippets)-----
+```
 
-- retrieved chunks are too verbose,
-- a high-level semantic search returns mixed or noisy passages,
-- you want to preserve only the relevant evidence.
+Benefits: fewer tokens sent downstream, less "lost in the middle" noise, faster and cheaper final generation. Trade-off: an extra LLM call per retrieved chunk, so it adds latency and cost at query time in exchange for a cleaner prompt.
 
-### 6.3 Ensemble / hybrid search
+### 3.5 Parent-document retrieval
 
-Hybrid search combines lexical retrieval and vector retrieval.
+Search small chunks (precise), return their larger parent chunk (context-rich):
 
-Example pattern:
+```python
+parent_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+child_splitter  = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
+
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,   # indexes child chunks
+    docstore=store,            # holds parent chunks (InMemoryStore, etc.)
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+retriever.add_documents([long_doc])
+```
+
+Use when the exact matching fact is small, but the answer needs the surrounding section for grounding.
+
+### 3.6 Hybrid search — BM25 + vector ensemble retrieval
+
+Combines lexical (BM25) and dense (vector) retrieval so exact-term queries and paraphrase-style queries both work well:
 
 ```python
 bm25_retriever = BM25Retriever.from_documents(TECH_DOCS)
@@ -252,62 +386,93 @@ ensemble_retriever = EnsembleRetriever(
 )
 ```
 
-Why it matters:
+**Why raw scores can't just be added:** vector similarity scores (e.g. `0.85`) and BM25 keyword scores (e.g. `14.5`) live on completely different, incompatible scales. Adding them raw would give one retriever an arbitrary, meaningless advantage. **Reciprocal Rank Fusion (RRF)** sidesteps this by ignoring raw scores entirely and combining only each document's *rank position* in each list.
 
-- **BM25** is strong for exact keyword matching and technical terms.
-- **Semantic retrieval** is strong for conceptual similarity and paraphrases.
-- **Hybrid search** balances both.
-
-This is useful for queries like:
-
-- "fast similarity lookup for embeddings"
-- "ACID transactions"
-- "How do I store AI model outputs for later retrieval?"
-
-### 6.4 Parent-document retriever
-
-`ParentDocumentRetriever` stores both a small child chunk for search and a larger parent chunk for context. This is useful when the best retrieval chunk is small, but the final answer needs broader surrounding context.
-
-Example logic from the project:
-
-```python
-parent_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
-child_splitter = RecursiveCharacterTextSplitter(chunk_size=200, chunk_overlap=20)
-
-retriever = ParentDocumentRetriever(
-    vectorstore=vectorstore,
-    docstore=store,
-    child_splitter=child_splitter,
-    parent_splitter=parent_splitter,
-)
+```mermaid
+flowchart TD
+    Q["Query: SKU-7742X specifications"] --> V["Vector Search"]
+    Q --> B["BM25 Search"]
+    V --> VR["Vector results:<br/>Doc 3 rank 1<br/>Doc 7 rank 2<br/>Doc 1 rank 5"]
+    B --> BR["BM25 results:<br/>Doc 1 rank 1<br/>Doc 3 rank 2<br/>Doc 5 rank 3"]
+    VR --> R["Reciprocal Rank Fusion<br/>score += weight / (rank + k)"]
+    BR --> R
+    R --> F["Final ranking:<br/>1. Doc 1  2. Doc 3  3. Doc 7"]
 ```
 
-Use when:
+$$
+\text{RRF contribution} = \text{weight} \times \frac{1}{\text{rank} + k}
+$$
 
-- the relevant fact is small, but the surrounding section matters,
-- you want precise retrieval without losing document-level context,
-- you need richer answer grounding for long docs.
+- **`weight`** — how much this retriever's opinion counts.
+- **`rank`** — the document's position from that retriever, from `enumerate` (0-indexed by convention, though see the note below).
+- **`k`** — a smoothing constant (commonly `60`) so first place doesn't completely dominate.
+
+Don't confuse this `k` with retrieval depth — they're unrelated numbers that happen to share a letter:
+
+| Symbol | What it controls | Typical value | Where it shows up |
+| :--- | :--- | :--- | :--- |
+| retriever `k` / `search_kwargs={"k": N}` | How many candidates *each* retriever returns before fusion | 3–4 | `bm25_retriever.k = 3`, `search_kwargs={"k": 3}` |
+| RRF `k` (also called `c`) | Smoothing constant inside the fusion formula | 60 | `custom_ensemble_search(..., c=60)`, `hybrid_retrieve(..., rrf_k=60)` |
+
+**Two slightly different RRF implementations exist in this repo — both valid, worth noticing the difference:**
+
+- [`hybrid_search/prod_hybrid_search.py`](../hybrid_search/prod_hybrid_search.py): `rrf_scores[doc_id] += weight / (c + rank + 1)` — treats rank as 1-indexed (adds `+1` to the 0-indexed `enumerate` rank).
+- [`hybrid_search/final_production.py`](../hybrid_search/final_production.py): `rrf_score = weight * (1.0 / (rank + rrf_k))` — uses the raw 0-indexed rank, no `+1`.
+
+With `k=60` the difference between these two is negligible in practice, but if you're porting one of these functions, pick one convention and use it consistently rather than mixing them.
+
+> ⚠️ **Bug found in `final_production.py`:** `HybridRetriever.add_documents()` calls `self.vectore.add_documents(documents)` — `self.vectore` is a typo for `self.vectorstore` and doesn't exist on the class, so calling `add_documents()` raises `AttributeError`.
+
+**Tuning weights:**
+
+| Situation | Starting weights (BM25, vector) |
+| :--- | :--- |
+| Unsure / mixed query traffic | `0.5 / 0.5` |
+| Codes, IDs, error strings dominate | `0.7 / 0.3` |
+| Natural-language, semantic queries dominate | `0.3 / 0.7` |
+
+**Production notes:**
+
+- BM25 has no incremental-update API in the typical in-memory implementation — rebuild it whenever documents are added or removed (see the `add_documents` method above, typo aside).
+- Hybrid search runs two searches, adding roughly 20–50ms. Measure it; decide if the accuracy gain is worth it for latency-critical paths.
+- Use hybrid search when your data has codes/IDs/acronyms/exact names, or query traffic is mixed. Pure vector search is fine for simple semantic Q&A, creative-writing assistants, or latency-critical prototypes.
+
+### 3.7 Reranking — *(course topic, not yet implemented in this repo)*
+
+The course roadmap image lists reranking as a Part 3 technique, but there's no reranker in the codebase yet — worth flagging so you know it's a gap, not something you missed reading. The general shape, for when you build it: retrieve a wider candidate set (e.g. top 20–50) cheaply with vector/hybrid search, then re-score that smaller set with a more expensive, more accurate model — a cross-encoder (scores query+document jointly instead of comparing independent embeddings) or a hosted reranker (e.g. Cohere Rerank) — and keep only the top few after re-scoring. It's a precision pass layered on top of a recall-oriented first retrieval, not a replacement for it.
 
 ---
 
-## 7. Production Vector Search: HNSW Trade-offs
+## Part 4: Scale for Production
 
-The course image highlights the most important choices in HNSW vector indexing.
+### 4.1 HNSW index parameters
 
-### Two parameters that matter
+HNSW (Hierarchical Navigable Small World graphs) is the dominant ANN index for vector search. Two parameters matter most:
 
-| Parameter | Meaning | Effect of higher value |
+| Parameter | Meaning | Effect of a higher value |
 | :--- | :--- | :--- |
-| `M` | Maximum connections per node | More memory, better recall/accuracy |
-| `ef` | Search effort during query-time traversal | Slower search, better accuracy |
+| `M` | Max connections per graph node | More memory, better recall/accuracy |
+| `ef` (search) | Search effort at query time | Slower search, better accuracy |
 
-### Practical trade-off summary
+In production you're usually trading off two of three: **accuracy**, **speed**, **memory**.
 
-- **More `M`** = more connections = more memory = better accuracy.
-- **More `ef`** = more search effort = slower = better accuracy.
-- In production, you usually must pick two among: **accuracy**, **speed**, and **memory**.
+```sql
+-- pgvector: build the index
+CREATE INDEX ON documents
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
 
-### Typical production choices
+-- pgvector: tune query-time accuracy/speed
+SET hnsw.ef_search = 100;  -- higher = more accurate, slower
+```
+
+```python
+# Chroma HNSW settings
+collection = client.create_collection(
+    name="my_collection",
+    metadata={"hnsw:M": 16, "hnsw:construction_ef": 100, "hnsw:search_ef": 50},
+)
+```
 
 | Use case | `M` | `ef` | Priority |
 | :--- | ---: | ---: | :--- |
@@ -315,501 +480,272 @@ The course image highlights the most important choices in HNSW vector indexing.
 | Production | 16 | 100 | Balanced |
 | High accuracy | 32 | 200 | Accuracy |
 
-This is the classic vector-search production trade-off: increasing recall and accuracy generally costs more time and memory.
+(The Chroma snippet above uses `search_ef: 50` rather than the "balanced" `100` — that's just a different tuning point, not an error; tune `ef_search` per your own latency/accuracy budget rather than copying a single number.)
 
----
+### 4.2 When and how to scale
 
-## 8. When and How to Scale Vector Stores
-
-### Vertical scaling (scale up)
-
-Vertical scaling means increasing CPU and RAM on a single database instance.
-
-Pros:
-
-- simple deployment,
-- no code changes,
-- lower operational complexity.
-
-Cons:
-
-- hardware limits,
-- capacity ceiling.
-
-Best for:
-
-- under roughly 10M vectors,
-- moderate to small production workloads,
-- teams that want the simplest setup first.
-
-### Horizontal scaling (shard)
-
-Horizontal scaling means splitting data across multiple nodes or instances.
-
-Pros:
-
-- unlimited scale potential,
-- stronger capacity for very large indexes.
-
-Cons:
-
-- more complex architecture,
-- result merging and coordination overhead,
-- higher operational complexity.
-
-Best for:
-
-- larger production systems,
-- more than 10M vectors,
-- workloads with heavy throughput and memory demands.
-
-### Rule of thumb
-
-> Most apps never need sharding. A single well-tuned instance often handles millions of vectors. Don’t over-engineer too early.
-
----
-
-## 9. Managed vs Self-hosted Vector Databases
-
-The image recommends a practical decision flow for choosing between managed and self-hosted vector databases.
-
-### Key comparison
-
-| Factor | Managed (e.g. Pinecone) | Self-hosted (e.g. pgvector) |
+| Symptom | Likely cause | Fix |
 | :--- | :--- | :--- |
-| Scaling | Automatic | You manage |
-| Ops burden | Zero | Significant |
-| Cost at scale | 65530$ | Lower $ |
-| Control | Limited | Full |
+| Query latency ≥ ~100ms | Index too large for memory | More RAM, or shard |
+| Insert latency spikes | Write bottleneck | Scale writes separately from reads |
+| Frequent out-of-memory errors | Index doesn't fit | Bigger instance, or shard |
+| Accuracy dropping | `ef_search` too low | Increase `ef_search` |
 
-### Decision flow
+### 4.3 Vertical vs. horizontal scaling
+
+**Vertical (scale up):** more CPU/RAM on one instance. Simple, no code changes, but hits a hardware ceiling. Best under ~10M vectors and for small-to-moderate workloads.
+
+**Horizontal (shard):** split data across nodes. Unlimited scale potential, but adds result-merging and coordination complexity. Best for >10M vectors or heavy throughput.
+
+> **Rule of thumb:** most apps never need sharding. A single well-tuned instance often handles millions of vectors — don't over-engineer early.
+
+### 4.4 Managed vs. self-hosted vector databases
 
 ```mermaid
 flowchart TD
     A["START"] --> B{"Under 1M vectors?"}
-    B -- Yes --> C["Single pgvector is fine"]
-    B -- No --> D{"Have DevOps team?"}
-    D -- No --> E["Use Pinecone"]
-    D -- Yes --> F{"Cost is primary concern?"}
+    B -- Yes --> C["Single pgvector instance is fine"]
+    B -- No --> D{"Have a DevOps team?"}
+    D -- No --> E["Use a managed service (Pinecone)"]
+    D -- Yes --> F{"Cost is the primary concern?"}
     F -- Yes --> G["Self-host pgvector"]
-    F -- No --> H["Pinecone for convenience"]
+    F -- No --> H["Managed, for convenience"]
 ```
 
-### Practical guidance
-
-- If you are small or early-stage, start with a single `pgvector` instance or a managed service.
-- If you have no ops capacity, a managed vector DB is usually the easiest route.
-- If your vector count grows and cost becomes critical, self-hosting can become attractive.
-- If you have strong engineering operations capacity and need more control, self-hosting can be a smart long-term decision.
-
----
-
-## 10. Best Practices for Production RAG
-
-- Keep chunk sizes moderate and consistent.
-- Preserve source metadata with each chunk.
-- Use recursive chunking first, then improve with semantic chunking if needed.
-- Combine semantic retrieval with keyword search when domain-specific terms matter.
-- Use compression or parent-document patterns when retrieval context is noisy or too broad.
-- Tune `M` and `ef` based on the accuracy–speed–memory trade-off.
-- Avoid scaling too early; single-instance optimization solves most real-world cases.
-- Use managed services when convenience and zero ops burden matter more than raw control.
-
----
-
-## 11. Summary
-
-The project demonstrates that retrieval quality depends on three things working together:
-
-1. Good document ingestion and metadata preservation.
-2. Strong chunking strategy based on content type.
-3. An appropriate retrieval pattern for the question and latency requirements.
-
-For production systems, the right answer is rarely “the biggest or most advanced architecture.” It is usually the smallest system that meets the retrieval quality and latency goals with enough headroom to scale when needed.
-
-### SemanticCache and CachedLLM
-
-Caching avoids paying for and waiting on a new LLM response when the application has already answered the same question. The example separates cache storage from LLM orchestration:
-
-| Component | Responsibility |
-| :--- | :--- |
-| `SemanticCache` | Stores queries and responses, normalizes query text, looks up cached responses, and reports the number of cached queries. |
-| `CachedLLM` | Wraps the LLM, checks the cache before every invocation, calls the model only on a miss, stores new responses, and tracks hits and misses. |
-
-The request flow is:
-
-```mermaid
-flowchart TD
-    Q["Incoming query"] --> N["Lowercase and trim"]
-    N --> H{"Cached response exists?"}
-    H -- Yes --> C["Return cached response"]
-    H -- No --> L["Call the LLM"]
-    L --> S["Store query and response"]
-    S --> R["Return new response"]
-```
-
-`SemanticCache._hash_query()` lowercases and trims the query, then creates an MD5 hash as the dictionary key. This means `What is Python?` and `What is python?` are treated as the same query. `get()` returns the stored response on a hit; otherwise it returns `None`. `set()` stores a new response, and `stats()` reports the number of cached entries.
-
-`CachedLLM.invoke()` first calls `self.cache.get(query)`. On a hit, it increments `cache_hits` and returns the response without calling `ChatOpenAI`. On a miss, it increments `cache_misses`, invokes `gpt-4o-mini`, stores the result, and returns it. `get_stats()` calculates the cache hit rate:
-
-$$
-	ext{hit rate} = \frac{\text{cache hits}}{\text{cache hits} + \text{cache misses}}
-$$
-
-Despite its name, the current `SemanticCache` is an **exact normalized cache**, not a true semantic cache. It has an `embedder` attribute and a similarity threshold, but `get()` does not use either one. A true semantic cache would embed the incoming query, compare it with stored query vectors, and return a response when similarity exceeds a threshold such as `0.9` or `0.95`.
-
-### Caching considerations
-
-- Cache only responses that are safe to reuse. Avoid caching answers that depend on the current user, permissions, real-time data, or rapidly changing state unless those factors are part of the cache key.
-- Include relevant context, model settings, prompt version, tenant, and user permissions in a production cache key when they can change the answer.
-- Add expiration or invalidation so stale answers are not returned forever.
-- Use a shared store such as Redis for multiple application instances; the example's in-memory dictionary is local to one process and is lost on restart.
-- Protect sensitive prompts and responses. Do not expose one user's cached response to another user.
-- Measure hit rate, latency, storage size, and the cost saved. A high hit rate is useful only when cached answers remain correct.
-
----
-
-## 🔁 Phases of RAG
-
-### Phase 1: Indexing
-
-```text
-Load -> Chunk -> Embed -> Store
-```
-
-### Phase 2: Query
-
-```text
-Embed query -> Search -> Retrieve -> Generate -> Answer
-```
-
-The query and indexed documents should use compatible embedding models. If the embedding model changes, re-embed the document collection.
-
----
-
-## ✅ Three Rules of Production RAG
-
-1. **Use the same compatible embedding model consistently** for documents and queries.
-2. **Embedding quality matters more than quantity.** More vectors cannot compensate for poor representations or noisy chunks.
-3. **Test retrieval independently of generation.** First verify that the correct source chunks are retrieved; then evaluate the generated answer.
-
----
-
-## ⚠️ Five Common RAG Failure Modes
-
-1. **Bad chunking** — relevant information is split apart or mixed with unrelated content.
-2. **Embedding mismatch** — documents and queries use incompatible models or preprocessing.
-3. **Retrieval noise** — top results are broadly similar but do not answer the question.
-4. **Context overflow** — too much retrieved text exceeds the useful context or dilutes the answer.
-5. **Hallucination** — the model produces unsupported claims when retrieval is incomplete or ambiguous.
-
----
-
-## 🧩 Recursive Character Splitting
-
-`RecursiveCharacterTextSplitter` does not understand meaning directly. It preserves coherence heuristically by trying configured separators in order, for example:
-
-```text
-paragraphs (\n\n) -> lines (\n) -> sentences -> words -> characters
-```
-
-Its results depend on the separator order, chunk size, overlap, and content type.
-
----
-
-## 📏 Vector Normalization
-
-Vector normalization scales a vector so its magnitude becomes 1 while preserving its direction. This can prevent magnitude from affecting similarity scores when magnitude is not intended to represent relevance:
-
-$$
-\hat{v} = \frac{v}{\lVert v \rVert}
-$$
-
-Normalization is not universally required. The embedding model, similarity metric, and vector database configuration must agree. Systems such as FAISS, Pinecone, and Chroma can use normalized or unnormalized vectors depending on their distance metric and index configuration.
-
----
-
-## 🔀 Hybrid Search
-
-Hybrid search combines:
-
-- **Dense vector search** for semantic similarity.
-- **Sparse or lexical search** such as BM25 for keywords and exact terms.
-
-It can reduce retrieval noise because semantic search alone may miss identifiers or overvalue broad concepts. A typical system retrieves candidates from both methods and combines or reranks their scores.
-
-### When vector search fails
-
-Vector search can fail when a query contains terms that must match exactly or have little semantic meaning:
-
-| Query type | Why dense search can fail | What lexical search contributes |
+| Factor | Managed (e.g. Pinecone) | Self-hosted (e.g. pgvector) |
 | :--- | :--- | :--- |
-| Product codes, e.g. `SKU-7742X` | The code has little semantic meaning for the embedding model. | Exact identifier matching. |
-| Error codes, e.g. `E_CONN_REFUSED` | Small character differences can change the meaning. | Finds the exact error string in troubleshooting documents. |
-| Acronyms, e.g. `WCAG` | The model may not know the abbreviation or may expand it inconsistently. | Matches the acronym exactly. |
-| Exact names, e.g. `John Smith Accounting` | Broad semantic matches can override the required specific name. | Preserves the exact entity or phrase match. |
+| Scaling | Automatic | You manage it |
+| Ops burden | ~Zero | Significant |
+| Cost at scale | Higher $, pay for convenience | Lower $, pay in ops time |
+| Control | Limited | Full |
 
-These are common enterprise RAG cases, not unusual edge cases. Hybrid search is especially useful when identifiers, error messages, acronyms, names, SKUs, or other exact terms are important.
+> The original notes here had a garbled "Cost at scale: 65530$" cell — that was a corrupted character, not a real number. Read it as "managed tends to cost more at scale; you're buying out the ops burden."
 
-### Important clarification
+**Purpose of each tool** (they all do similarity search over embeddings — the difference is environment and operational model):
 
-Hybrid search is not a truncation strategy. It is a retrieval strategy that combines lexical and semantic signals. Truncation or reranking may be applied afterward to select the final context passed to the LLM.
+| Tool | Purpose / environment | Best use case |
+| :--- | :--- | :--- |
+| `pgvector` | PostgreSQL extension | Embeddings alongside relational data, queried with SQL filters (`WHERE user_id=123 AND embedding <-> query_vector`). Best when Postgres is already central to your stack. |
+| `FAISS` | In-memory C++/Python library | Fast local/GPU-accelerated search for research, prototyping, large in-memory datasets. |
+| `Chroma` | Open-source Python vector DB | Developer-friendly, tight LangChain integration. Great for prototypes and small-to-medium RAG pipelines. |
+| `Pinecone` | Managed cloud-native vector DB | Billions of vectors, hybrid search, automatic scaling, enterprise reliability. |
 
-### BM25 vs. vector search
+`pgvector` specifics: supports exact nearest-neighbor (perfect recall) and approximate search via IVFFlat/HNSW; distance metrics include L2, inner product, cosine, L1, Hamming, Jaccard; full ACID compliance, transactions, JOINs, point-in-time recovery — because it's just Postgres.
 
-| Search method | Particularly good at |
-| :--- | :--- |
-| **BM25 / lexical search** | Exact matches, rare terms, product codes, error codes, and IDs. |
-| **Vector search** | Semantic similarity, synonyms, paraphrases, and natural-language questions. |
+`Pinecone` specifics: serverless, object-storage backed; writes acknowledged in <100ms; dense, sparse, and full-text indexes behind one API; SOC 2 / HIPAA / GDPR / ISO 27001; 99.95% uptime SLA.
 
-Each method compensates for the weaknesses of the other. Hybrid search combines both signals to improve recall and precision.
+### 4.5 Connecting to Supabase / pgvector
 
-### Hybrid Search Pipeline with RRF
+From [`supabase/01_supbase_connection.py`](../supabase/01_supbase_connection.py) — a real connection pattern with SSL handling and a local-Postgres fallback:
 
-Reciprocal Rank Fusion (RRF) combines the rankings from vector search and BM25 without requiring their raw scores to be on the same scale.
+```python
+def normalize_database_url(url: str) -> str:
+    """Supabase requires sslmode=require; add it if missing."""
+    if ".supabase.co" in url and "sslmode=" not in url:
+        return f"{url}?sslmode=require"
+    return url
+
+vectorstore = PGVector(
+    embeddings=embeddings,
+    collection_name="production_docs",
+    connection=connection_url,
+    use_jsonb=True,
+)
+```
+
+The file tries Supabase first, then falls back to a local Postgres instance if the Supabase connection fails — a reasonable pattern for local dev against a prod-shaped store. CLI setup for a real project:
+
+```bash
+supabase login
+supabase init
+supabase link --project-ref <your-project-ref>
+```
+
+### 4.6 Caching
+
+Two layers, cheapest first:
+
+1. **Normalize + hash** — lowercase/trim the query, then hash it (e.g. MD5) as a cache key. Catches only *exact* (post-normalization) repeats.
+2. **Semantic cache** — embed the query, search the cache by vector similarity, return the cached response if similarity ≥ a threshold (e.g. `0.9`–`0.95`). Catches paraphrases too.
+
+From [`rag_pipelin/cost_optimization.py`](../rag_pipelin/cost_optimization.py):
+
+```python
+class SemanticCache:
+    def _hash_query(self, query):
+        return hashlib.md5(query.lower().strip().encode()).hexdigest()
+
+    def get(self, query):
+        return self.cache.get(self._hash_query(query), {}).get("response")   # exact match only
+
+    def set(self, query, response):
+        self.cache[self._hash_query(query)] = {"query": query, "response": response}
+```
+
+```python
+class CachedLLM:
+    def invoke(self, query):
+        cached = self.cache.get(query)
+        if cached:
+            self.cache_hits += 1
+            return cached, True
+        self.cache_misses += 1
+        response = self.llm.invoke(query).content
+        self.cache.set(query, response)
+        return response, False
+```
+
+$$
+\text{hit rate} = \frac{\text{cache hits}}{\text{cache hits} + \text{cache misses}}
+$$
+
+> **Naming mismatch worth knowing:** despite the class name, `SemanticCache.get()` here only does an exact normalized-hash lookup — it has an `embedder` attribute and a `threshold`, but `get()` never uses either. It's an **exact cache**, not a semantic one. A true semantic cache would embed the incoming query and compare it against stored query vectors, returning a hit above the similarity threshold — the code's own trailing comment confirms this is the intended "production version," just not what's implemented yet.
+
+**Caching considerations for production:**
+
+- Cache only responses safe to reuse — avoid caching answers that depend on the current user, permissions, or fast-changing data unless those are part of the cache key.
+- Include model settings, prompt version, tenant, and permissions in the cache key when they can change the answer.
+- Add expiration/invalidation so stale answers don't live forever.
+- Use a shared store (Redis) across instances — an in-memory dict, as here, is local to one process and lost on restart.
+- Never let one user's cached response leak to another user.
+- Measure hit rate, latency, storage size, and cost saved — a high hit rate only helps if the cached answers are still correct.
+
+### 4.7 Cost optimization: model routing and token budgets
+
+Also from `cost_optimization.py` — two patterns not covered above:
+
+**Model routing** — classify query complexity with a cheap model, then route to a cheap or expensive model accordingly:
+
+```python
+class ModelRouter:
+    def classify_complexity(self, query):
+        # cheap_model classifies as "simple" or "complex"
+        ...
+
+    def invoke(self, query):
+        complexity = self.classify_complexity(query)
+        model = self.cheap_model if complexity == "simple" else self.expensive_model
+        return model.invoke(query)
+```
+
+This trades one extra cheap LLM call (the classifier) for the chance to route most simple queries away from the expensive model.
+
+**Token budgeting** — reject or track requests against a per-request token ceiling:
+
+```python
+class TokenBudget:
+    def check_budget(self, text):
+        tokens = self.estimate_tokens(text)     # rough: len(text.split()) * 1.3
+        return tokens <= self.max_per_request, tokens
+```
+
+`BudgetedLLM` raises `ValueError` before calling the model if the estimated input tokens exceed the budget — a cheap guard against runaway prompts, though note the estimate is a rough word-count heuristic, not an actual tokenizer count (a real implementation would use `tiktoken` or the provider's tokenizer).
+
+### 4.8 Observability: the three pillars
+
+> Observability means understanding what the system is doing across the *entire* journey — not just judging the final answer.
+
+| Pillar | Answers | Examples |
+| :--- | :--- | :--- |
+| **Traces** | What happened? | Agent flow, inputs/outputs, tool calls, decisions made |
+| **Metrics** | How much did it cost? | Token count, latency per node, cost per run, error rates |
+| **Evals** | Was it good? | Correctness, relevance, human feedback, regression detection |
+
+**Traces — LangSmith**, from [`observability/langsmith_setup.py`](../observability/langsmith_setup.py):
+
+```python
+os.environ["LANGSMITH_TRACING"] = "true"
+
+@traceable(name="named_runs_demo", tags=["production", "summarization"])
+def demo_named_runs():
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"text": "..."})
+```
+
+Tags and metadata on `@traceable` let you filter traces in the LangSmith dashboard by run type, user, or request kind later.
+
+**Metrics + structured logs**, from [`observability/monitoring.py`](../observability/monitoring.py) — logs as JSON for aggregation, plus a running metrics summary:
+
+```python
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            **getattr(record, "extra_data", {}),
+        })
+
+class MetricsCollector:
+    def get_summary(self):
+        return {
+            "error_rate": errors_total / requests_total,
+            "avg_latency_ms": latency_sum / latency_count,
+            "cache_hit_rate": cache_hits / (cache_hits + cache_misses),
+        }
+```
+
+`InstrumentedLLM` wraps a chat model with both at once — one `@traceable` call that times the request, records tokens/latency/errors into `MetricsCollector`, and logs a structured JSON line — giving trace, metric, and log for every call from a single wrapper.
+
+### 4.9 Production API blueprint *(course reference — not yet built in this repo)*
+
+This is the request pipeline the course lays out for a production LLM API. It isn't implemented as code here yet (no `fastapi`/`slowapi`/Docker files exist in this repo currently) — treat it as the target architecture to build toward, stitched from the pieces above:
 
 ```mermaid
 flowchart TD
-    Q["Query: SKU-7742X specifications"] --> V["Vector Search"]
-    Q --> B["BM25 Search"]
-
-    V --> VR["Vector results:<br/>Doc 3 rank 1<br/>Doc 7 rank 2<br/>Doc 1 rank 5"]
-    B --> BR["BM25 results:<br/>Doc 1 rank 1<br/>Doc 3 rank 2<br/>Doc 5 rank 3"]
-
-    VR --> R["Reciprocal Rank Fusion<br/>RRF score = 1 / (k + rank)"]
-    BR --> R
-    R --> F["Final ranked results:<br/>1. Doc 1<br/>2. Doc 3<br/>3. Doc 7"]
+    A["Client Request"] --> B["Rate Limiter (e.g. slowapi, per-IP)"]
+    B --> C["Security Middleware<br/>injection check + PII masking"]
+    C --> D["Cache Layer<br/>hit? return cached : continue"]
+    D --> E["Output Validator<br/>primary model -> retry -> fallback model"]
+    E --> F["Metrics + Structured Logging"]
+    F --> G["JSON Response"]
 ```
 
-Documents that rank well in both searches receive stronger combined rankings. In the example, `Doc 1` wins because it is the top BM25 result and also appears in the vector results.
+| Feature | Maps to | What it does |
+| :--- | :--- | :--- |
+| LangSmith tracing | [§4.8](#48-observability-the-three-pillars) | Every request traced with metadata |
+| Input sanitization + PII masking | new | Blocks prompt injection, redacts emails/SSNs/cards before the LLM sees them |
+| Error handling + retries | new | Exponential backoff, fallback models on primary failure |
+| Response caching | [§4.6](#46-caching) | Skip duplicate LLM calls |
+| Rate limiting | new | Per-IP throttling |
+| Structured logging + metrics | [§4.8](#48-observability-the-three-pillars) | JSON logs, request count, latency, token usage |
+| Health checks + Docker | new | `/health` endpoint, containerized deployment |
 
-### Why raw hybrid scores cannot be added
+The end-to-end production checklist, as a pipeline of concerns:
 
-Hybrid search commonly uses two retrievers with incompatible score scales:
+```text
+Security (sanitize input, mask PII, guard output)
+   -> Cost Optimization (route, cache, budget)
+   -> Error Handling (retry, circuit-break, fallback)
+   -> Monitoring (log, measure, trace)
+```
 
-1. **Vector search** ranks documents by semantic similarity. Depending on the distance metric and implementation, scores may look like `0.85` or `0.72`.
-2. **BM25** ranks documents by keyword frequency and rarity. Its scores may look like `14.5` or `9.2`.
+### 4.10 Best practices recap
 
-A BM25 score of `14.5` does not represent the same level of relevance as a vector score of `0.85`. Adding the raw scores would therefore give one retriever an arbitrary advantage. Reciprocal Rank Fusion avoids this problem by ignoring raw scores and combining only document positions in each ranked list.
-
-### Reciprocal Rank Fusion mechanics
-
-For a document returned by a retriever, the weighted RRF contribution is:
-
-$$
-	ext{RRF contribution} = \text{weight} \times \frac{1}{\text{rank} + k}
-$$
-
-Where:
-
-- **`weight`** controls how much the retriever contributes.
-- **`rank`** is the zero-based position produced by Python's `enumerate`: first place is `0`, second place is `1`, and so on.
-- **`k`** is a smoothing constant. A value such as `60` makes the difference between adjacent ranks gradual, so first place does not completely dominate.
-
-The merge process is:
-
-1. Run each retriever and collect its ranked results.
-2. For every document, calculate its weighted RRF contribution.
-3. Use a stable document key, such as an ID or normalized content, to identify the same document across retrievers.
-4. Add contributions when a document appears in both result lists.
-5. Sort documents by their combined RRF score and keep the desired number of results.
-
-This rewards documents that rank well in both systems. A document with a moderate rank in vector search and BM25 can beat a document that ranks first in only one retriever.
-
-### Production considerations
-
-| Consideration | Recommendation |
-| :--- | :--- |
-| **BM25 index updates** | BM25 does not support incremental updates in the usual in-memory implementation. Rebuild it whenever documents are added or removed. |
-| **Starting weights** | Begin with `weights=[0.5, 0.5]` for BM25 and vector search, then tune using representative queries. |
-| **Code and ID-heavy queries** | Try `weights=[0.7, 0.3]` to give BM25 more influence for product codes, error codes, and IDs. |
-| **Semantic or natural-language queries** | Try `weights=[0.3, 0.7]` to give vector search more influence. |
-| **Mixed query traffic** | Keep the balanced `0.5/0.5` starting point until evaluation data shows a better split. |
-| **RRF constant** | Retrieve enough candidates for fusion; `k=4` or higher is a practical minimum, while larger values such as `60` provide stronger smoothing. |
-| **Latency** | Hybrid search performs two searches and may add roughly `20-50 ms`. Measure this in production and decide whether the accuracy gain justifies the cost. |
-
-Monitor which retriever contributes the final results, as well as recall, precision, latency, and answer quality. Tune weights from query patterns and evaluation results rather than from a single example.
-
-### When to use hybrid search
-
-Use hybrid search when:
-
-- Enterprise data contains product codes, error codes, IDs, acronyms, or exact names.
-- Technical documentation, legal documents, or other exact terminology must be retrieved reliably.
-- Queries are mixed: some require exact matching while others are semantic or conversational.
-- Retrieval accuracy is more important than the small latency increase from running two searches.
-- The application serves real users and retrieval quality has been evaluated on representative questions.
-
-Pure vector search is often sufficient when:
-
-- The application is a simple question-and-answer chatbot with mostly natural-language queries.
-- The system is a quick prototype and retrieval quality is not yet a production concern.
-- The workload is creative writing or another task where exact document matching is not important.
-- Latency is critical and an additional `20-50 ms` is not acceptable.
-
-| Situation | Default choice |
-| :--- | :--- |
-| Enterprise knowledge base with codes or IDs | **Use hybrid search** |
-| Technical or legal documentation | **Use hybrid search** |
-| Mixed query types | **Use hybrid search** |
-| Simple semantic Q&A | **Pure vector search may be sufficient** |
-| Creative writing assistant | **Pure vector search may be sufficient** |
-| Latency-critical prototype | **Start with pure vector search** |
-
-Hybrid search rarely harms retrieval quality when configured and evaluated properly, but it is not automatically the right choice for every latency-sensitive workload.
+- Keep chunk sizes moderate and consistent; preserve source metadata on every chunk.
+- Recursive chunking by default; semantic chunking where topic boundaries matter more than ingest cost.
+- Combine semantic + keyword (hybrid) search when domain-specific terms matter.
+- Use compression or parent-document retrieval when context is noisy or too broad.
+- Tune `M` and `ef` for your accuracy/speed/memory budget; don't shard before you need to.
+- Cache aggressively but safely — key on everything that can change the answer.
+- Instrument everything (traces + metrics + logs) before you need them, not after an incident.
 
 ---
 
-## Final Takeaway
+## Final takeaway
 
-There is no universal best chunk size, embedding model, or retrieval method. Start with recursive chunking, preserve metadata, use hybrid search when exact terms matter, and evaluate retrieval on representative questions before tuning generation.
+There is no universal best chunk size, embedding model, or retrieval method. Start with recursive chunking, preserve metadata, add hybrid search when exact terms matter, and evaluate retrieval independently of generation on representative questions before tuning anything else.
 
+---
 
-Observability ->
-What is observability - Understanding what our system is doing - the entire journey not just the final answer
+## Appendix: verification notes on this repo
 
-Traces(what happened) -
-- Agent flow
-- Inputs/ outputs
-- Tool calls
-- Decisions made
+Things checked against the actual code while rewriting this doc, for future reference:
 
-Metrics(How much it cost) -
-- Token count
-- Latency per node
-- Cost per run
-- Error rates
-
-Evals(Was it good ?)
-- Correctness
-- Relevance
-- Human Feedback Regression detection
-
-
-Using Langsmith as an observability tool
-
-
-
-For structured docs recursive chunking is better where as for unstructured docs that's where semantic chunking shines
-
-Advanced RAG Strategies - 
-
-1) Parent Document Retriver - Basically we search small chunks first as they are faster and more accurate and then search bigger chunks with them for more context, this is an advanced rag method
-2) Contextual Compression for retreivel - In LangChain, a compressor is a processing module that filters, trims, or transforms retrieved document chunks before they are passed to your prompt or main LLM chain.
-
-What compressor is in your code:
-Here, compressor = LLMChainExtractor.from_llm(llm) uses an LLM (in your case, Google Gemini) specifically to read through retrieved documents and extract only the sentences or passages that directly answer or relate to the query, stripping out any irrelevant filler text.
-
-What is its use?
-Standard vector search usually retrieves entire chunks (e.g., 500–1000 words per document). Often, only a few sentences in those chunks are relevant to the user's question, while the rest is irrelevant clutter.
-
-The compressor solves this problem through a two-step retrieval pipeline:
-
-Base Retriever: Fetches the top-4 full document chunks from your vector database (which might contain a lot of extra, non-essential text).
-
-Compressor (LLMChainExtractor): Receives those 4 full documents, evaluates each one against the user's query using the LLM, extracts only the exact relevant sentences, and drops the rest.
-
-Key Benefits
-Reduces Token Usage: You don't waste tokens sending irrelevant background text to your final LLM prompt.
-
-Reduces Prompt Noise ("Lost in the Middle"): Large language models perform better when given concise, highly targeted context rather than long documents stuffed with irrelevant details.
-
-Saves Cost and Latency: Passing smaller, cleaner context downstream leads to faster final responses and lower API costs.
-
-Visual Workflow -> 
-[ User Query ]
-      │
-      ▼
-[ Vector Store ] ──(retrieves 4 full docs)──► [ Compressor (LLMChainExtractor) ]
-                                                            │
-                                        (strips non-relevant filler text)
-                                                            │
-                                                            ▼
-[ Final Prompt ] ◄──(sends only concise, relevant snippets)─┘
-
-The benefits of this - Reduction of token usage and cost, we have better llm responses, faster processing
-
-Include the rest of the points from advanced_rag.py
-
-Scaling RAG Systems ->
-Index scaling and which parameters matter ->
-HNSW Parameters(Heirarchical navigable small world graphs)
-
-
-pgvector - creating an HNSW index
-CREATE INDEX ON documents
-USING hnsw (embedding vector_cosine_ops)
-WITH (m = 16, ef_construction = 64);
-
-At query time, serach ef_search
-SET hnsw.ef_search = 100; Higher = more accurate, slower
-
-Chroma - HNSW settings 
-collection = client.create_collection(
-    name = 'my_collection',
-    metadata = {
-        'hnsw:M': 16,
-        'hnsw:construction_ef': 100,
-        'hnsw:search_ef': 50
-    }
-)
-
-When and how to scale ->
-1) If the query is taking 100 ms or more, likely we have index which is too large for memory so we would need to increase the ram or shard
-2) If the inserting latency is spiking then we have rite bottle neck and solution is to scale rite separately
-3) If we get a lot of out of memory error then the reason for that is basically the index doesn't fit, solution would be to have a bigger instance or shard
-4) If accuracy is dropping then ef_search is very low and the solution would be to increase
-
-
-Pinecone is a fully managed, cloud-native vector database designed for AI workloads, while pgvector is an open-source PostgreSQL extension that adds vector similarity search capabilities directly inside Postgres. Pinecone is ideal for production-scale applications needing serverless scalability and enterprise-grade reliability, whereas pgvector is best suited for developers who want vector search tightly integrated with relational data in Postgres.
-
-🔑 Pinecone Overview
-Type: Managed vector database (SaaS)
-
-Architecture: Serverless, object-storage backed (e.g., AWS S3) with distributed query execution
-
-Performance:
-
-Writes acknowledged in <100ms
-
-Queries remain fast at any scale (p99 latency ~33ms for dense indexes with 10M records)
-
-Features:
-
-Dense, sparse, and full-text indexes in one API
-
-Hybrid search (semantic + keyword + full-text)
-
-Automatic scaling, no cluster management
-
-Enterprise-grade security (SOC 2, HIPAA, GDPR, ISO 27001)
-
-99.95% uptime SLA
-
-Use Cases: RAG pipelines, semantic search, recommender systems, AI agents
-
-🔑 pgvector Overview
-Type: PostgreSQL extension (open-source)
-
-Integration: Runs inside Postgres, vectors stored alongside relational data
-
-Performance:
-
-Supports exact nearest neighbor search (perfect recall)
-
-Approximate search via IVFFlat and HNSW indexes for speed-recall tradeoffs
-
-Features:
-
-Distance metrics: L2, inner product, cosine, L1, Hamming, Jaccard
-
-Supports single-precision, half-precision, binary, and sparse vectors
-
-ACID compliance, point-in-time recovery, JOINs, transactions (all Postgres features)
-
-Works with any language that has a Postgres client
-
-Installation: CREATE EXTENSION vector; after compiling or installing via package managers (Homebrew, Docker, PGXN, etc.)
-
-Use Cases: Embedding search in apps already using Postgres, small-to-medium scale vector workloads
-
+- **`basics/embeddings_deep.py`** — `embedding_caching()` references an undefined `embeddings_model` (only `embeddings` exists at module scope). Will raise `NameError` if called.
+- **`hybrid_search/final_production.py`** — `HybridRetriever.add_documents()` calls `self.vectore.add_documents(...)`; should be `self.vectorstore`. Will raise `AttributeError` if called.
+- **`hybrid_search/prod_hybrid_search.py` vs `final_production.py`** — implement RRF with a one-position rank offset difference (`rank + 1` vs raw `rank`). Both are defensible RRF variants; not a bug, just an inconsistency if you're copying code between them.
+- **`basics/document_loaders.py`** — despite the name, mostly implements native-Python alternatives to LangChain's loader classes rather than calling `TextLoader`/`WebBaseLoader`/`DirectoryLoader` directly. Only the PDF path uses a real LangChain loader (`UnstructuredLoader`).
+- The original version of this document had a corrupted "Cost at scale: 65530$" table cell (an encoding artifact, not a real figure) and several other mangled Unicode characters (stray `â`, `ð` sequences) — cleaned up throughout.
+- Reranking is named in the course's Part 3 roadmap and the production-API slide, but there's no reranker implementation anywhere in this repo yet — flagged above as a gap rather than silently omitted.
+- A few screenshots referenced when preparing this pass (python.org downloads/iOS/Windows-installer pages) didn't correspond to anything in the RAG curriculum or this codebase, so nothing from them was incorporated here — flagging in case they were meant for a different note.
