@@ -9,7 +9,7 @@ A revision guide for Retrieval-Augmented Generation, organized around the course
 | **Part 3** | Optimize for Quality | Semantic chunking, reranking, multi-query retrieval |
 | **Part 4** | Scale for Production | Caching, monitoring, production vector databases |
 
-> **Stack used throughout this repo:** LangChain (`langchain-classic`, `langchain-community`), Google Gemini via `langchain-google-genai` (`gemini-flash-latest` for chat, `gemini-embedding-2-preview` for embeddings), Chroma as the default vector store, `rank-bm25` for lexical search, LangSmith for tracing, and `langchain-postgres` / Supabase for pgvector. `rag_pipelin/cost_optimization.py` is the one file that uses OpenAI models (`gpt-4o-mini`, `gpt-4o`) instead of Gemini — worth knowing if you go looking for it.
+> **Stack used throughout this repo:** LangChain (`langchain-classic`, `langchain-community`), Google Gemini via `langchain-google-genai` (`gemini-flash-latest` for chat, `gemini-embedding-2-preview` for embeddings), Chroma as the default vector store, `rank-bm25` for lexical search, LangSmith for tracing, and `langchain-postgres` / Supabase for pgvector.
 
 ---
 

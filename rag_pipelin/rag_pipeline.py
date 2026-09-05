@@ -43,7 +43,7 @@ LangChain itself is open source and free. LangSmith (the observability platform)
 
 ## Getting Started
 
-Install with: pip install langchain langchain-openai
+Install with: pip install langchain langchain-google-genai
 Create your first chain in under 10 lines of code.
 """
 llm = ChatGoogleGenerativeAI(model="gemini-flash-latest")
